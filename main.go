@@ -17,11 +17,12 @@ func main() {
 	if err != nil {
 		log.Fatalln(err)
 	}
+	defer ln.Close()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Fatalln(err)
+			log.Println(err)
 		}
 
 		go handle(conn)
@@ -32,18 +33,36 @@ func handle(conn net.Conn) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
-	req, err := parseReq(reader)
 
-	if err != nil {
-		fmt.Println(err)
-		return
+	for {
+		req, err := parseReq(reader)
+
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				log.Println(err)
+			}
+
+			return
+		}
+
+		log.Println(conn.RemoteAddr(), req.Method, req.Path)
+
+		if req.Method == "POST" {
+			if err := parseBody(reader, req); err != nil {
+				log.Println(conn.RemoteAddr(), err)
+				return
+			}
+		}
+
+		connection := req.Headers["connection"]
+		keepAlive := strings.ToLower(connection) != "close"
+
+		sendRes(conn, req, keepAlive)
+
+		if !keepAlive {
+			return
+		}
 	}
-
-	log.Println(req.Method, req.Path)
-
-	parseBody(reader, req)
-
-	sendRes(conn, req)
 }
 
 type HTTPReq struct {
@@ -83,13 +102,13 @@ func parseReq(reader *bufio.Reader) (*HTTPReq, error) {
 			req.Path = parts[1]
 			req.Protocol = parts[2]
 		} else {
-			b := bytes.SplitN(line, []byte(": "), 2)
+			b := bytes.SplitN(line, []byte(":"), 2)
 			if len(b) != 2 {
 				return nil, errors.New("Corrupt headers")
 			}
 
 			key := strings.ToLower(string(bytes.TrimSpace(b[0])))
-			val := string(b[1])
+			val := string(bytes.TrimSpace(b[1]))
 
 			req.Headers[key] = val
 
@@ -104,13 +123,13 @@ func parseReq(reader *bufio.Reader) (*HTTPReq, error) {
 func parseBody(reader *bufio.Reader, req *HTTPReq) error {
 	cl, ok := req.Headers["content-length"]
 	if !ok {
-		return nil
+		return errors.New("No content")
 	}
 
 	length, err := strconv.Atoi(strings.TrimSpace(cl))
 
 	if err != nil {
-		fmt.Println("Invalid content length")
+		return errors.New("Invalid content length")
 	}
 
 	if length > 1<<24 {
@@ -128,15 +147,31 @@ func parseBody(reader *bufio.Reader, req *HTTPReq) error {
 	return nil
 }
 
-func sendRes(conn net.Conn, req *HTTPReq) {
+func sendRes(conn net.Conn, req *HTTPReq, keepAlive bool) error {
 	writer := bufio.NewWriter(conn)
 
 	writer.WriteString("HTTP/1.1 200 OK\r\n")
-	for k, v := range req.Headers {
-		fmt.Fprintf(writer, "%s: %s\r\n", k, v)
+	writer.WriteString("Content-Type: text/plain\r\n")
+	writer.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(req.Body)))
+
+	if keepAlive {
+		writer.WriteString("Connection: keep-alive\r\n")
+	} else {
+		writer.WriteString("Connection: close\r\n")
 	}
+
 	writer.WriteString("\r\n")
 
-	writer.Write(req.Body)
-	writer.Flush()
+	if len(req.Body) > 0 {
+		if _, err := writer.Write(req.Body); err != nil {
+			log.Println(conn.RemoteAddr(), err)
+		}
+	}
+
+	if err := writer.Flush(); err != nil {
+		log.Println(conn.RemoteAddr(), err)
+		return err
+	}
+
+	return nil
 }
