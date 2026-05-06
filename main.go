@@ -8,8 +8,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -35,6 +37,7 @@ func handle(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 
 	for {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		req, err := parseReq(reader)
 
 		if err != nil {
@@ -47,45 +50,69 @@ func handle(conn net.Conn) {
 
 		log.Println(conn.RemoteAddr(), req.Method, req.Path)
 
-		if req.Method == "POST" {
+		if req.Method == "POST" && req.Headers.ContentLength > 0 {
+			conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 			if err := parseBody(reader, req); err != nil {
 				log.Println(conn.RemoteAddr(), err)
 				return
 			}
 		}
 
-		connection := req.Headers["connection"]
-		keepAlive := strings.ToLower(connection) != "close"
+		keepAlive := !slices.Contains(req.Headers.Connection, "close")
 
 		sendRes(conn, req, keepAlive)
 
 		if !keepAlive {
 			return
 		}
+		conn.SetReadDeadline(time.Now().Add(1 * time.Minute))
 	}
+}
+
+type Headers struct {
+	ContentType   string
+	ContentLength int
+	UserAgent     string
+	Connection    []string
+	Host          string
+	Others        map[string]string
 }
 
 type HTTPReq struct {
 	Method   string
 	Path     string
 	Protocol string
-	Headers  map[string]string
+	Headers  *Headers
 	Body     []byte
 }
 
 func parseReq(reader *bufio.Reader) (*HTTPReq, error) {
-	req := HTTPReq{Headers: make(map[string]string)}
+	req := HTTPReq{Headers: &Headers{Others: make(map[string]string)}}
 
 	n := 0
+	limit := 1 << 20
+	length := 0
 
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, isPrefix, err := reader.ReadLine()
 
 		if err != nil {
 			return nil, err
 		}
 
-		line = bytes.TrimSuffix(line, []byte("\r\n"))
+		length += len(line)
+
+		if isPrefix {
+			return nil, errors.New("Header line too long")
+		}
+
+		if length > limit {
+			return nil, errors.New("Too long headers")
+		}
+
+		if n > 100 {
+			return nil, errors.New("Too many headers")
+		}
 
 		if len(line) == 0 {
 			break
@@ -108,36 +135,63 @@ func parseReq(reader *bufio.Reader) (*HTTPReq, error) {
 			}
 
 			key := strings.ToLower(string(bytes.TrimSpace(b[0])))
-			val := string(bytes.TrimSpace(b[1]))
+			val := bytes.TrimSpace(b[1])
 
-			req.Headers[key] = val
+			switch key {
+			case "connection":
+				for _, v := range bytes.Split(val, []byte(",")) {
+					req.Headers.Connection = append(
+						req.Headers.Connection,
+						strings.ToLower(string(bytes.TrimSpace(v))),
+					)
+				}
+
+			case "host":
+				req.Headers.Host = string(val)
+
+			case "user-agent":
+				req.Headers.UserAgent = string(val)
+
+			case "content-type":
+				req.Headers.ContentType = strings.ToLower(string(val))
+
+			case "content-length":
+				if req.Headers.ContentLength > 0 {
+					return nil, errors.New("Duplicate Content-length")
+				}
+
+				v, err := strconv.Atoi(string(val))
+				if err != nil || v < 0 {
+					return nil, errors.New("Invalid Content-length")
+				}
+
+				req.Headers.ContentLength = v
+
+			default:
+				req.Headers.Others[key] = string(val)
+			}
 
 		}
 
 		n++
 	}
 
+	if req.Protocol == "HTTP/1.1" && req.Headers.Host == "" {
+		return nil, errors.New("Missing host header")
+	}
+
 	return &req, nil
 }
 
 func parseBody(reader *bufio.Reader, req *HTTPReq) error {
-	cl, ok := req.Headers["content-length"]
-	if !ok {
-		return errors.New("No content")
-	}
-
-	length, err := strconv.Atoi(strings.TrimSpace(cl))
-
-	if err != nil {
-		return errors.New("Invalid content length")
-	}
+	length := req.Headers.ContentLength
 
 	if length > 1<<24 {
 		return errors.New("Too long for me")
 	}
 
 	body := make([]byte, length)
-	_, err = io.ReadFull(reader, body)
+	_, err := io.ReadFull(reader, body)
 
 	if err != nil {
 		return err
