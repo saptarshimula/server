@@ -1,0 +1,11 @@
+package templates
+
+templ Index(name string) {
+	<div>
+		if name != "" {
+			<p>{ name }, is it you?</p>
+		} else {
+			<p>Who are you?</p>
+		}
+	</div>
+}
